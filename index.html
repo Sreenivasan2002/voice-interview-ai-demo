@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Voice Interview AI Demo - Challenge 1</title>
+  <title>Voice Interview AI Demo - Fixed</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; max-width: 900px; line-height: 1.6; background: #f5f5f5; }
     .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -12,6 +12,8 @@
     button { padding: 10px 20px; margin: 5px 5px 10px 0; font-size: 16px; cursor: pointer; background: #0066cc; color: white; border: none; border-radius: 4px; }
     button:disabled { background: #999; cursor: not-allowed; }
     .filler { color: #e67e22; font-style: italic; font-weight: bold; margin: 10px 0; padding: 8px; background: #fff3e0; border-left: 4px solid #e67e22; border-radius: 4px; }
+    #conversation { background: #f9f9f9; padding: 15px; border-radius: 4px; min-height: 60px; margin: 10px 0; }
+    #summary { background: #e3f2fd; padding: 15px; border-radius: 4px; min-height: 60px; margin: 10px 0; }
   </style>
 
   <script type="importmap">
@@ -45,7 +47,6 @@
 
   <script type="module">
     import { pipeline, env } from '@xenova/transformers';
-    import { loadWhisper, transcribeChunk } from './whisper.js';
 
     env.logLevel = 'silent';
     env.allowLocalModels = false;
@@ -60,34 +61,40 @@
     const startMicBtn = document.getElementById('startMicBtn');
     const stopMicBtn = document.getElementById('stopMicBtn');
 
-    let summarizer = null;
     let transcriber = null;
+    let summarizer = null;
     let audioContext = null;
     let stream = null;
-    let processor = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
     let lastSpeechTime = Date.now();
     let fillerCooldown = false;
-    let currentChunk = [];
     let fullConversation = '';
+    let isProcessing = false;
+    let silenceTimer = null;
 
     loadBtn.addEventListener('click', async () => {
       loadBtn.disabled = true;
-      status.textContent = 'Loading summarizer + Whisper-tiny...';
+      status.textContent = 'Loading Whisper tiny + T5 small...';
 
       try {
-        summarizer = await pipeline('summarization', 'Xenova/t5-small', {
-          device: 'webgpu',
+        // Load Whisper tiny for transcription (~40MB)
+        status.textContent = 'Loading Whisper tiny (~40MB)...';
+        transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en', {
           quantized: true
         });
 
-        transcriber = await loadWhisper();
+        // Load T5 for summarization
+        status.textContent = 'Loading T5 small summarizer...';
+        summarizer = await pipeline('summarization', 'Xenova/t5-small', {
+          quantized: true
+        });
 
-        status.textContent = '✅ All models loaded! Click Start Mic.';
+        status.textContent = '✅ Models loaded! Click Start Mic.';
         startMicBtn.disabled = false;
       } catch (err) {
         status.textContent = '❌ Load failed: ' + err.message;
         console.error(err);
-      } finally {
         loadBtn.disabled = false;
       }
     });
@@ -96,39 +103,82 @@
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        const source = audioContext.createMediaStreamSource(stream);
-        processor = audioContext.createScriptProcessor(512, 1, 1);
+        // Use MediaRecorder for better audio capture
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
 
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-
-        processor.onaudioprocess = (e) => {
-          const input = e.inputBuffer.getChannelData(0);
-          let sum = 0;
-          for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
-          const energy = sum / input.length;
-
-          if (energy > 0.001) {
-            lastSpeechTime = Date.now();
-            currentChunk.push(...input);
-          } else {
-            const silenceMs = Date.now() - lastSpeechTime;
-            if (silenceMs > 3000 && !fillerCooldown) {
-              speakFiller("Okay... let me process that.");
-              fillerCooldown = true;
-              setTimeout(() => fillerCooldown = false, 6000);
-
-              if (currentChunk.length > 4000 && transcriber) {
-                const buffer = new Float32Array(currentChunk);
-                processAudioChunk(buffer);
-              }
-              currentChunk = [];
-            }
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
           }
         };
 
-        status.textContent = '🎤 Listening... Speak clearly, then pause 4+ seconds';
+        mediaRecorder.onstop = async () => {
+          if (audioChunks.length > 0 && !isProcessing) {
+            await processAudio();
+          }
+          audioChunks = [];
+        };
+
+        // Start recording in chunks
+        mediaRecorder.start();
+
+        // Simple VAD: detect silence and process
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        
+        function checkAudio() {
+          if (!stream || !stream.active) return;
+
+          analyser.getByteFrequencyData(dataArray);
+          const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+
+          if (average > 10) {
+            // Speech detected
+            lastSpeechTime = Date.now();
+            if (silenceTimer) {
+              clearTimeout(silenceTimer);
+              silenceTimer = null;
+            }
+          } else {
+            // Silence detected
+            const silenceMs = Date.now() - lastSpeechTime;
+            
+            if (silenceMs > 2000 && !silenceTimer && !isProcessing) {
+              silenceTimer = setTimeout(async () => {
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                  mediaRecorder.stop();
+                  
+                  if (!fillerCooldown) {
+                    speakFiller("Let me think about that...");
+                    fillerCooldown = true;
+                    setTimeout(() => fillerCooldown = false, 5000);
+                  }
+                  
+                  // Restart recording after processing
+                  setTimeout(() => {
+                    if (mediaRecorder && stream && stream.active) {
+                      audioChunks = [];
+                      mediaRecorder.start();
+                    }
+                  }, 100);
+                }
+                silenceTimer = null;
+              }, 500);
+            }
+          }
+
+          requestAnimationFrame(checkAudio);
+        }
+
+        checkAudio();
+
+        status.textContent = '🎤 Microphone active | Speak and pause for transcription';
         startMicBtn.disabled = true;
         stopMicBtn.disabled = false;
       } catch (err) {
@@ -138,8 +188,10 @@
     });
 
     stopMicBtn.addEventListener('click', () => {
-      if (stream) stream.getTracks().forEach(t => t.stop());
-      if (processor) processor.disconnect();
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
+      if (stream) stream.getTracks().forEach(track => track.stop());
       if (audioContext) audioContext.close();
 
       status.textContent = 'Mic stopped.';
@@ -147,19 +199,68 @@
       stopMicBtn.disabled = true;
     });
 
-    async function processAudioChunk(buffer) {
+    async function processAudio() {
+      if (isProcessing || audioChunks.length === 0) return;
+      
+      isProcessing = true;
+      const startTime = Date.now();
+      status.textContent = '🔄 Transcribing...';
+
       try {
-        const text = await transcribeChunk(transcriber, buffer);
-        if (text && text.length > 5) {
-          fullConversation += (fullConversation ? ' ' : '') + text;
+        // Convert audio blob to array buffer
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        const arrayBuffer = await audioBlob.arrayBuffer();
+
+        // Decode audio
+        const audioContextForDecode = new AudioContext({ sampleRate: 16000 });
+        const audioBuffer = await audioContextForDecode.decodeAudioData(arrayBuffer);
+        const audioData = audioBuffer.getChannelData(0);
+
+        // Transcribe
+        const transcribeStart = Date.now();
+        const result = await transcriber(audioData, {
+          chunk_length_s: 30,
+          stride_length_s: 5,
+          return_timestamps: false
+        });
+        const transcribeTime = Date.now() - transcribeStart;
+
+        const transcription = result.text.trim();
+        
+        if (transcription && transcription.length > 3) {
+          fullConversation += (fullConversation ? ' ' : '') + transcription;
           convDiv.textContent = fullConversation;
 
-          const output = await summarizer(text, { max_new_tokens: 40 });
-          summaryDiv.textContent = output[0].summary_text || '(summary generated)';
+          metrics.textContent = `Transcription: ${transcribeTime}ms | Text length: ${transcription.length} chars`;
+
+          // Summarize if we have enough content
+          if (fullConversation.length > 50) {
+            status.textContent = '🔄 Generating summary...';
+            const summaryStart = Date.now();
+            
+            const summaryResult = await summarizer(fullConversation, { 
+              max_new_tokens: 50,
+              min_length: 10
+            });
+            
+            const summaryTime = Date.now() - summaryStart;
+            const totalTime = Date.now() - startTime;
+            
+            summaryDiv.textContent = summaryResult[0].summary_text;
+            metrics.textContent = `Transcription: ${transcribeTime}ms | Summary: ${summaryTime}ms | Total: ${totalTime}ms`;
+            status.textContent = '✅ Ready for next speech';
+          } else {
+            status.textContent = '✅ Ready for next speech';
+          }
+        } else {
+          status.textContent = '⚠️ No clear speech detected';
         }
+
       } catch (err) {
-        console.error('Transcription/summary error:', err);
-        summaryDiv.textContent = '(error during processing)';
+        status.textContent = '❌ Processing error: ' + err.message;
+        console.error(err);
+      } finally {
+        isProcessing = false;
       }
     }
 
